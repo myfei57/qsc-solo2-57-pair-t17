@@ -55,7 +55,8 @@
     "quota": {
       "meter_wrap_mwh": 100000.0,
       "sample_period_s": 30.0,
-      "period_hours": 24.0
+      "period_hours": 24.0,
+      "default_meter_kind": "trade"
     }
   }
 }

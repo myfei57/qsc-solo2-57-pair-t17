@@ -50,6 +50,8 @@ class Api:
         add("GET", "/api/pressure", self._pressure)
         add("GET", "/api/quota", self._quota)
         add("GET", "/api/billing", self._billing)
+        add("GET", "/api/carry", self._carry)
+        add("GET", "/api/reconcile", self._reconcile)
         add("GET", "/api/trend", self._trend)
         add("GET", "/api/events", self._events)
         add("GET", "/api/audit", self._audit)
@@ -68,6 +70,8 @@ class Api:
         add("POST", "/api/retrofit", self._retrofit)
         add("POST", "/api/secondary/cycle", self._secondary_cycle)
         add("POST", "/api/meter", self._meter)
+        add("POST", "/api/meter/outage", self._meter_outage)
+        add("POST", "/api/allocate", self._allocate)
         add("POST", "/api/settle", self._settle)
         add("POST", "/api/zone/split", self._split)
         add("POST", "/api/valve/replay", self._replay)
@@ -176,8 +180,20 @@ class Api:
         return self._platform.quota_report()
 
     def _billing(self, params: dict, body: dict) -> dict:
-        quota = float(params.get("quota_mwh", self._platform.config.quota.meter_wrap_mwh / 40.0))
-        return {"lines": self._platform.billing(quota)}
+        platform = self._platform
+        quota_raw = params.get("quota_mwh")
+        quota = platform.ledger.quota_mwh if quota_raw is None else float(quota_raw)
+        period_raw = params.get("period")
+        period = None if period_raw is None else int(period_raw)
+        return {"lines": platform.billing(quota, period)}
+
+    def _carry(self, params: dict, body: dict) -> dict:
+        period_raw = params.get("period")
+        period = None if period_raw is None else int(period_raw)
+        return self._platform.carry_sheets(period)
+
+    def _reconcile(self, params: dict, body: dict) -> dict:
+        return self._platform.reconcile_quota()
 
     def _trend(self, params: dict, body: dict) -> dict:
         signal = params.get("signal", "supply_c")
@@ -298,13 +314,39 @@ class Api:
         return self._platform.secondary_cycle(_as_float(body, "dt", 1.0))
 
     def _meter(self, params: dict, body: dict) -> dict:
+        measured_raw = body.get("measured_at")
         return self._platform.collect_heat(
             str(body.get("meter", self._platform.meter_names()[0])),
             _as_float(body, "delta_mwh", 1.0),
+            measured_at=None if measured_raw is None else float(measured_raw),
+            window_id=str(body.get("window_id", "")),
+        )
+
+    def _meter_outage(self, params: dict, body: dict) -> dict:
+        started_raw = body.get("started_at")
+        return self._platform.declare_meter_outage(
+            str(body.get("meter", self._platform.meter_names()[0])),
+            _as_float(body, "estimated_mwh", 0.0),
+            started_at=None if started_raw is None else float(started_raw),
+            window_id=str(body.get("window_id", "")),
+            note=str(body.get("note", "console-outage")),
+            station="console",
+        )
+
+    def _allocate(self, params: dict, body: dict) -> dict:
+        return self._platform.allocate_heat(
+            str(body.get("station", "")),
+            _as_float(body, "delta_mwh", 0.0),
+            origin=str(body.get("origin", "console")),
         )
 
     def _settle(self, params: dict, body: dict) -> dict:
-        return self._platform.settle_quota()
+        boundary_raw = body.get("boundary_at")
+        quota_raw = body.get("quota_mwh")
+        return self._platform.settle_quota(
+            boundary_at=None if boundary_raw is None else float(boundary_raw),
+            quota_mwh=None if quota_raw is None else float(quota_raw),
+        )
 
     def _split(self, params: dict, body: dict) -> dict:
         stations = body.get("stations") or []

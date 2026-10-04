@@ -9,6 +9,7 @@ from __future__ import annotations
 import threading
 
 from .meter import HeatMeter
+from . import policy
 
 
 class QuotaAccumulator:
@@ -27,6 +28,11 @@ class QuotaAccumulator:
                 raise ValueError(f"热量表重名: {meter.name}")
             self._meters[meter.name] = meter
             return meter
+
+    def register_meter(self, name: str, wrap_mwh: float, kind: str = policy.KIND_TRADE) -> HeatMeter:
+        """按名登记一块热量表并指定表型（表型决定跨期归属口径）。"""
+
+        return self.register(HeatMeter(name, wrap_mwh, kind))
 
     def meters(self) -> list[str]:
         """返回全部表名（排序后）。"""

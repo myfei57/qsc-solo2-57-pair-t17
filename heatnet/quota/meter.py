@@ -3,23 +3,28 @@
 表读数到顶后回绕，因此同时维护"当前读数"和"累计热量"：前者是现场表头，后者是
 结算用的总量。累加必须原子——``self._reading += delta`` 在多线程下会读改写交错，
 丢掉的增量既不在表头也不在总量里。
+
+每块表登记时还要带上表型（``trade`` 贸易结算表 / ``run`` 运行考核表），表型
+决定跨期归属口径（计量时刻 / 到达时刻），见 :mod:`heatnet.quota.policy`。
 """
 
 from __future__ import annotations
 
 import threading
 
+from . import policy
 from .state import MeterSnapshot
 
 
 class HeatMeter:
     """一块带回绕的热量表。"""
 
-    def __init__(self, name: str, wrap_mwh: float) -> None:
+    def __init__(self, name: str, wrap_mwh: float, kind: str = policy.KIND_TRADE) -> None:
         if wrap_mwh <= 0:
             raise ValueError("回绕阈值必须为正")
         self._name = name
         self._wrap_mwh = float(wrap_mwh)
+        self._kind = policy.normalize_kind(kind)
         self._reading_mwh = 0.0
         self._total_mwh = 0.0
         self._wraps = 0
@@ -33,6 +38,15 @@ class HeatMeter:
     @property
     def wrap_mwh(self) -> float:
         return self._wrap_mwh
+
+    @property
+    def kind(self) -> str:
+        return self._kind
+
+    def policy(self) -> str:
+        """返回本表的跨期归属口径。"""
+
+        return policy.policy_for(self._kind)
 
     def add(self, delta_mwh: float) -> float:
         """原子累加一次热量增量，返回累加后的表头读数。"""
@@ -92,4 +106,5 @@ class HeatMeter:
                 total_mwh=self._total_mwh,
                 wraps=self._wraps,
                 increments=self._increments,
+                kind=self._kind,
             )

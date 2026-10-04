@@ -74,9 +74,10 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     config = load_config(config_path) if config_path else default_config()
     platform = build_platform(config, clock=clock, storage_root=getattr(args, "storage_root", None))
 
-    # 演示从干净基线起步：先清掉上一轮落盘的平台计数，并解除上一轮演示结束时
-    # 留下的停机保护，否则这一次会直接从带故障的状态起跑。
+    # 演示从干净基线起步：先清掉上一轮落盘的平台计数与跨期结转，并解除上一轮
+    # 演示结束时留下的停机保护，否则这一次会直接从带故障/已结算的状态起跑。
     platform.reset_state()
+    platform.reset_quota_carry()
     if platform.source.state() == "tripped":
         platform.reset_source("demo-baseline")
 
@@ -89,8 +90,39 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     calibration = platform.calibrate_flow(args.baseline_t_h)
     retrofit = platform.retrofit_baseline(args.baseline_kpa)
     secondary = platform.secondary_cycle(args.dt)
+    # 热量采集分三段，把跨期口径全部走一遍：
+    # 1) 第 1 期正常到账；2) st01 贸易表申报断流挂预提、st06 考核表申报断流挂账；
+    # 3) 第 1 期结算后，两表按窗口补传（预提冲平），另有一笔 st02 贸易表的
+    #    迟到增量（第 1 期计量、第 2 期到账），先冲第 2 期再以前期调整补回。
     heat = [platform.collect_heat(name, args.sample_mwh) for name in platform.meter_names()]
-    settled = platform.settle_quota()
+    boundary_1 = clock.now()
+    platform.collect_heat("st01.heat-meter", args.sample_mwh)
+    platform.collect_heat("st06.heat-meter", args.sample_mwh)
+    outage_trade = platform.declare_meter_outage(
+        "st01.heat-meter", args.sample_mwh, window_id="demo-gap-trade", note="demo-outage"
+    )
+    outage_run = platform.declare_meter_outage(
+        "st06.heat-meter", args.sample_mwh, window_id="demo-gap-run", note="demo-outage"
+    )
+    settled = platform.settle_quota(boundary_at=boundary_1)
+    clock.advance(config.quota.period_hours * 3600.0)
+    recovery_trade = platform.collect_heat(
+        "st01.heat-meter",
+        args.sample_mwh,
+        measured_at=boundary_1 - config.quota.sample_period_s,
+        window_id="demo-gap-trade",
+    )
+    recovery_run = platform.collect_heat(
+        "st06.heat-meter",
+        args.sample_mwh,
+        measured_at=boundary_1 - config.quota.sample_period_s,
+        window_id="demo-gap-run",
+    )
+    late_trade = platform.collect_heat(
+        "st02.heat-meter", args.sample_mwh, measured_at=boundary_1 - config.quota.sample_period_s
+    )
+    boundary_2 = clock.now()
+    settled_next = platform.settle_quota(boundary_at=boundary_2)
     split = platform.split_zone(args.split_zone, args.split_stations, args.new_zone)
     queued = platform.queue_commands(args.station, [55.0, 62.0], "demo-operator")
     replayed = platform.replay_valves([args.station])
@@ -120,7 +152,14 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "retrofit": retrofit,
         "secondary": {key: secondary[key] for key in ("ok", "flow_t_h", "pump_idle", "violations")},
         "heat": heat,
+        "outage_trade": outage_trade,
+        "outage_run": outage_run,
         "settled": settled,
+        "recovery_trade": recovery_trade,
+        "recovery_run": recovery_run,
+        "late_trade": late_trade,
+        "settled_next": settled_next,
+        "reconcile": platform.reconcile_quota(),
         "split": split,
         "queued": queued,
         "replayed": {key: replayed[key] for key in ("ok", "replayed", "applied")},

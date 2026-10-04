@@ -266,13 +266,21 @@ class QuotaLimits:
     meter_wrap_mwh: float
     sample_period_s: float
     period_hours: float
+    default_meter_kind: str = "trade"
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "QuotaLimits":
+        kind = str(section.get("default_meter_kind", "trade")).strip().lower()
+        if kind not in ("trade", "run"):
+            raise ConfigError(
+                "quota.default_meter_kind 必须是 trade（贸易结算表）或 run（运行考核表）",
+                component="config",
+            )
         return cls(
             meter_wrap_mwh=_number(section, "meter_wrap_mwh", minimum=1.0),
             sample_period_s=_number(section, "sample_period_s", minimum=1.0),
             period_hours=_number(section, "period_hours", minimum=0.1),
+            default_meter_kind=kind,
         )
 
 
@@ -344,7 +352,7 @@ def default_config() -> PlatformConfig:
         valve=ValveLimits(12.0, 1.5),
         pump=PumpLimits(40.0, 20.0, 100.0),
         pressure=PressureLimits(240.0, 430.0, 6.0),
-        quota=QuotaLimits(100000.0, 30.0, 24.0),
+        quota=QuotaLimits(100000.0, 30.0, 24.0, "trade"),
     )
 
 
@@ -406,6 +414,7 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "meter_wrap_mwh": cfg.quota.meter_wrap_mwh,
                 "sample_period_s": cfg.quota.sample_period_s,
                 "period_hours": cfg.quota.period_hours,
+                "default_meter_kind": cfg.quota.default_meter_kind,
             },
         },
     }

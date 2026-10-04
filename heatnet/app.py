@@ -29,7 +29,9 @@ from .pump.curve import PumpCurve
 from .pump.pump import Pump
 from .quota.accumulator import QuotaAccumulator
 from .quota.billing import billing_lines
+from .quota.carryover import CarryError
 from .quota.meter import HeatMeter
+from .quota import policy
 from .quota.quota import QuotaLedger
 from .secondary.cycle import run_cycle
 from .secondary.loop import SecondaryLoop
@@ -65,6 +67,10 @@ _ZONE_SPECS: tuple[tuple[str, float, tuple[str, ...]], ...] = (
 
 # 热量表按站登记，回绕阈值取配置值。
 _METER_SUFFIX = ".heat-meter"
+
+# 按站指定运行考核表（按到达时刻归属）；其余表按默认表型（贸易结算表，
+# 按计量时刻归属）。表型是跨期口径的唯一依据，在装配期定死。
+_RUN_KIND_STATIONS = frozenset({"st06"})
 
 
 class Platform:
@@ -118,6 +124,7 @@ class Platform:
         self._lock = threading.RLock()
         self._register_namespaces()
         self._restore()
+        self._restore_carry()
 
     # ---- 装配 ---------------------------------------------------------
 
@@ -156,11 +163,15 @@ class Platform:
         return Pump("secondary.circulating", self.config.pump, curve)
 
     def _build_meters(self) -> None:
-        """按站登记热量表。"""
+        """按站登记热量表，并把表型与归属关系定死进结转账册。"""
 
         wrap = self.config.quota.meter_wrap_mwh
+        default_kind = self.config.quota.default_meter_kind
         for name in sorted(self.stations):
-            self.meters.register(HeatMeter(f"{name}{_METER_SUFFIX}", wrap))
+            meter_name = f"{name}{_METER_SUFFIX}"
+            kind = policy.KIND_RUN if name in _RUN_KIND_STATIONS else default_kind
+            self.meters.register(HeatMeter(meter_name, wrap, kind))
+            self.ledger.register_station_meter(meter_name, name, kind)
 
     def _register_namespaces(self) -> None:
         """登记现场设备命名空间（控制台与审计共用同一套名字）。"""
@@ -209,6 +220,18 @@ class Platform:
             "platform_state",
             {"operations": self._operations, "cycles": self._cycles, "unit": self.unit},
         )
+
+    def _persist_carry(self) -> None:
+        """把跨期结转账册落盘（结转条目、分站账、期次边界）。"""
+
+        self.store.write("quota_carry", self.ledger.carry.to_dict())
+
+    def _restore_carry(self) -> None:
+        """从落盘状态恢复结转账册。"""
+
+        state = self.store.read("quota_carry")
+        if isinstance(state, dict):
+            self.ledger.carry.load_dict(state)
 
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写审计，并记一条汇总事件。"""
@@ -555,27 +578,195 @@ class Platform:
             commands = [queue.enqueue(target, source) for target in targets]
             return {"station": station, "queued": [command.as_dict() for command in commands]}
 
-    def collect_heat(self, meter: str, delta_mwh: float) -> dict:
-        """采集一次热量并记进本期总账。"""
+    def collect_heat(
+        self,
+        meter: str,
+        delta_mwh: float,
+        measured_at: float | None = None,
+        window_id: str = "",
+    ) -> dict:
+        """采集一次热量增量并按表型口径入账。
+
+        增量同时带计量时刻（``measured_at``，缺省取当前时钟）与到达时刻，
+        归属由表型口径定死：贸易表按计量时刻、考核表按到达时刻。带
+        ``window_id`` 表示断流窗口的恢复补传，走预提冲平路径。
+        """
 
         with self._lock:
-            reading = self.meters.collect(meter, delta_mwh)
-            self.ledger.allocate(meter[: -len(_METER_SUFFIX)], delta_mwh)
-            self.trend.append("heat_mwh", self.clock.now(), self.meters.total_mwh())
+            arrived_at = self.clock.now()
+            moment = arrived_at if measured_at is None else float(measured_at)
+            heat_meter = self.meters.get(meter)
+            reading = heat_meter.add(delta_mwh)
+            record = self.ledger.carry.intake(
+                meter, delta_mwh, moment, arrived_at, window_id=window_id
+            )
+            self._persist_carry()
+            self.bus.publish(
+                Event.of(
+                    "quota",
+                    "quota",
+                    "heat_intake",
+                    asset=meter,
+                    severity="notice",
+                    message=(
+                        f"热量增量到账 {record.station} "
+                        f"({policy.kind_label(heat_meter.kind)}/"
+                        f"{'计量时刻' if record.policy == 'measured' else '到达时刻'})"
+                    ),
+                    meter=meter,
+                    station=record.station,
+                    kind=heat_meter.kind,
+                    policy=record.policy,
+                    delta_mwh=round(float(delta_mwh), 4),
+                    measured_at=round(moment, 3),
+                    arrived_at=round(arrived_at, 3),
+                    attributed_period=record.attributed_period,
+                    window_id=window_id,
+                    recovery=bool(window_id),
+                )
+            )
+            self.trend.append("heat_mwh", arrived_at, self.meters.total_mwh())
             return {
                 "meter": meter,
+                "station": record.station,
+                "kind": heat_meter.kind,
+                "policy": record.policy,
                 "delta_mwh": round(float(delta_mwh), 4),
+                "measured_at": round(moment, 3),
+                "arrived_at": round(arrived_at, 3),
+                "attributed_period": record.attributed_period,
                 "reading_mwh": round(reading, 4),
                 "total_mwh": round(self.meters.total_mwh(), 4),
+                "recovery": bool(window_id),
             }
 
-    def settle_quota(self) -> dict:
-        """结束本期配额并把结算行一并返回。"""
+    def allocate_heat(self, station: str, delta_mwh: float, origin: str = "console") -> dict:
+        """站级手工补录（无表增量）：直接记入本期分站账并落审计。
+
+        用于站点报量等不经过热量表的补录路径；能量同样进入守恒口径，
+        不能成为采集与结算之外的对账黑洞。
+        """
 
         with self._lock:
-            lines = self.billing(self.config.quota.meter_wrap_mwh / 40.0)
-            period = self.ledger.settle()
-            return {**period, "lines": lines}
+            value = max(0.0, float(delta_mwh))
+            total = self.ledger.allocate(station, value)
+            self._persist_carry()
+            self.bus.publish(
+                Event.of(
+                    "quota",
+                    "quota",
+                    "heat_allocated",
+                    asset=station,
+                    severity="notice",
+                    message=f"站级补录 {station} +{value} MWh",
+                    station=station,
+                    delta_mwh=round(value, 4),
+                    period=self.ledger.carry.period(),
+                    origin=origin,
+                )
+            )
+            return {
+                "station": station,
+                "delta_mwh": round(value, 4),
+                "allocated_mwh": round(total, 4),
+                "period": self.ledger.carry.period(),
+            }
+
+    def declare_meter_outage(
+        self,
+        meter: str,
+        estimated_mwh: float,
+        *,
+        started_at: float | None = None,
+        window_id: str = "",
+        note: str = "collection_outage",
+        station: str = "console",
+    ) -> dict:
+        """申报某块表结算期采集断流（部分失败），缺量按预估值挂账而不是当零。
+
+        贸易表挂预提并计入本期费用；考核表只挂账跟踪，恢复补传顺延到到账期。
+        预估量必须为正——报零等于把断流当作零。
+        """
+
+        with self._lock:
+            declared_at = self.clock.now()
+            start = declared_at if started_at is None else float(started_at)
+            heat_meter = self.meters.get(meter)
+            try:
+                entry = self.ledger.carry.declare_outage(
+                    meter,
+                    estimated_mwh,
+                    declared_at,
+                    started_at=start,
+                    window_id=window_id,
+                    note=note,
+                )
+            except CarryError as error:
+                raise PlantError(str(error), component="quota") from error
+            self._persist_carry()
+            self.bus.publish(
+                Event.of(
+                    "quota",
+                    "quota",
+                    "collection_outage",
+                    asset=meter,
+                    severity="alarm",
+                    message=(
+                        f"采集断流挂账 {entry.station}：预估缺口 {estimated_mwh} MWh，"
+                        "属部分失败，缺量不当零"
+                    ),
+                    meter=meter,
+                    station=entry.station,
+                    kind=heat_meter.kind,
+                    window_id=entry.window_id,
+                    estimated_mwh=round(float(estimated_mwh), 4),
+                    billable=entry.billable,
+                    declared_by=station,
+                    note=note,
+                )
+            )
+            return {
+                "ok": True,
+                "entry": entry.as_dict(),
+                "meter": meter,
+                "kind": heat_meter.kind,
+            }
+
+    def settle_quota(self, boundary_at: float | None = None, quota_mwh: float | None = None) -> dict:
+        """结束本期配额：先冲平往期结转，再结本期，结转单一并返回并落审计。"""
+
+        with self._lock:
+            boundary = self.clock.now() if boundary_at is None else float(boundary_at)
+            cap = self.ledger.quota_mwh if quota_mwh is None else float(quota_mwh)
+            try:
+                settled = self.ledger.settle(boundary_at=boundary, quota_mwh=cap)
+            except CarryError as error:
+                raise PlantError(str(error), component="quota") from error
+            self._persist_carry()
+            sheet = settled["carry_sheet"]
+            self.bus.publish(
+                Event.of(
+                    "quota",
+                    "quota",
+                    "quota_settled",
+                    severity="warning" if settled["status"] == "partial" else "notice",
+                    message=(
+                        f"第 {settled['period']} 期结算：{settled['status']}，"
+                        f"新开结转 {sheet['opened_count']} 条、冲平 {sheet['closed_count']} 条、"
+                        f"滚动 {sheet['rolled_count']} 条"
+                    ),
+                    period=settled["period"],
+                    boundary_at=settled["boundary_at"],
+                    status=settled["status"],
+                    total_mwh=settled["total_mwh"],
+                    opened_count=sheet["opened_count"],
+                    closed_count=sheet["closed_count"],
+                    rolled_count=sheet["rolled_count"],
+                    carry_sheet=sheet,
+                    reconcile=settled["reconcile"],
+                )
+            )
+            return settled
 
     def trip(self, reason: str = "overtemperature") -> dict:
         """让热源停机。"""
@@ -749,18 +940,43 @@ class Platform:
         return payload
 
     def quota_report(self) -> dict:
-        """返回热量表与配额总账报告。"""
+        """返回热量表与配额总账报告（含跨期结转视图）。"""
 
+        carry = self.ledger.carry
+        latest = carry.latest_sheet()
         return {
             "ledger": self.ledger.snapshot().as_dict(),
             "accumulator": self.meters.describe(),
             "periods": self.ledger.periods(),
+            "current_period": carry.period(),
+            "quota_mwh": round(self.ledger.quota_mwh, 4),
+            "boundaries": [round(value, 3) for value in carry.boundaries()],
+            "open_carry": [entry.as_dict() for entry in carry.open_entries()],
+            "latest_carry_sheet": latest.as_dict() if latest else None,
+            "reconcile": carry.reconcile(),
         }
 
-    def billing(self, quota_mwh: float) -> list[dict]:
-        """按站生成配额结算行。"""
+    def carry_sheets(self, period: int | None = None) -> dict:
+        """返回结转单（可按期过滤），供控制台展示。"""
 
-        return billing_lines(self.ledger, quota_mwh)
+        carry = self.ledger.carry
+        sheets = [sheet for sheet in carry.sheets() if period is None or sheet.period == period]
+        return {
+            "count": len(sheets),
+            "current_period": carry.period(),
+            "sheets": [sheet.as_dict() for sheet in sheets],
+        }
+
+    def reconcile_quota(self) -> dict:
+        """校验结转单、分站账与到账流水三账一致。"""
+
+        return self.ledger.carry.reconcile()
+
+    def billing(self, quota_mwh: float | None = None, period: int | None = None) -> list[dict]:
+        """按站生成配额结算行（未结算期包含断流预提视角）。"""
+
+        cap = self.ledger.quota_mwh if quota_mwh is None else float(quota_mwh)
+        return billing_lines(self.ledger.carry, cap, period)
 
     def plan_preview(self, demand_pct: float) -> list[dict]:
         """预览一次调度计划（不触碰设备）。"""
@@ -829,7 +1045,7 @@ class Platform:
             "mapping": self.mapping.describe(),
             "trend": self.trend.snapshot(),
             "alarms_recent": self.audit.alarms()[-10:],
-            "billing": self.billing(self.config.quota.meter_wrap_mwh / 40.0),
+            "billing": self.billing(),
         }
 
     def note_error(self, error: PlantError) -> dict:
@@ -854,6 +1070,18 @@ class Platform:
         if not self.store.exists("platform_state"):
             return False
         return self.store.remove("platform_state")
+
+    def reset_quota_carry(self) -> bool:
+        """清空跨期结转的内存与落盘状态（演示/标定基线用）。
+
+        生产财务结转不能走这里；它只在需要"从第 1 期重新演示"时调用。
+        """
+
+        removed = self.store.exists("quota_carry")
+        if removed:
+            self.store.remove("quota_carry")
+        self.ledger.reset_carry()
+        return removed
 
 
 def build_platform(
