@@ -15,10 +15,11 @@ from .state import MeterSnapshot
 class HeatMeter:
     """一块带回绕的热量表。"""
 
-    def __init__(self, name: str, wrap_mwh: float) -> None:
+    def __init__(self, name: str, wrap_mwh: float, kind: str = "heat") -> None:
         if wrap_mwh <= 0:
             raise ValueError("回绕阈值必须为正")
         self._name = name
+        self._kind = str(kind)
         self._wrap_mwh = float(wrap_mwh)
         self._reading_mwh = 0.0
         self._total_mwh = 0.0
@@ -29,6 +30,12 @@ class HeatMeter:
     @property
     def name(self) -> str:
         return self._name
+
+    @property
+    def kind(self) -> str:
+        """表型（跨期归属规则按表型定死，见 :mod:`heatnet.quota.carryover`）。"""
+
+        return self._kind
 
     @property
     def wrap_mwh(self) -> float:

@@ -50,6 +50,7 @@ class Api:
         add("GET", "/api/pressure", self._pressure)
         add("GET", "/api/quota", self._quota)
         add("GET", "/api/billing", self._billing)
+        add("GET", "/api/carryover", self._carryover)
         add("GET", "/api/trend", self._trend)
         add("GET", "/api/events", self._events)
         add("GET", "/api/audit", self._audit)
@@ -179,6 +180,10 @@ class Api:
         quota = float(params.get("quota_mwh", self._platform.config.quota.meter_wrap_mwh / 40.0))
         return {"lines": self._platform.billing(quota)}
 
+    def _carryover(self, params: dict, body: dict) -> dict:
+        period = params.get("period")
+        return self._platform.carryover_report(None if period is None else int(period))
+
     def _trend(self, params: dict, body: dict) -> dict:
         signal = params.get("signal", "supply_c")
         samples = self._platform.trend.series(signal, limit=int(params.get("limit", 60)))
@@ -298,9 +303,11 @@ class Api:
         return self._platform.secondary_cycle(_as_float(body, "dt", 1.0))
 
     def _meter(self, params: dict, body: dict) -> dict:
+        measured = body.get("measured_at")
         return self._platform.collect_heat(
             str(body.get("meter", self._platform.meter_names()[0])),
             _as_float(body, "delta_mwh", 1.0),
+            None if measured is None else _as_float(body, "measured_at", 0.0),
         )
 
     def _settle(self, params: dict, body: dict) -> dict:

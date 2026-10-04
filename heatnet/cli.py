@@ -31,6 +31,7 @@ DEFAULT_PROBE_PATHS = (
     "/api/audit",
     "/api/stations",
     "/api/quota",
+    "/api/carryover",
 )
 
 
@@ -91,6 +92,13 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     secondary = platform.secondary_cycle(args.dt)
     heat = [platform.collect_heat(name, args.sample_mwh) for name in platform.meter_names()]
     settled = platform.settle_quota()
+    # 跨期结转演示：一条计量时刻落在上一期的迟到增量先挂预提，第二期结算时
+    # 冲平成补记行；其余表在第二期正常采集，避免演示误报断流挂账。
+    late = platform.collect_heat(
+        platform.meter_names()[0], args.sample_mwh, measured_at=platform.clock.now() - 3600.0
+    )
+    heat_second = [platform.collect_heat(name, args.sample_mwh) for name in platform.meter_names()]
+    resettled = platform.settle_quota()
     split = platform.split_zone(args.split_zone, args.split_stations, args.new_zone)
     queued = platform.queue_commands(args.station, [55.0, 62.0], "demo-operator")
     replayed = platform.replay_valves([args.station])
@@ -121,6 +129,9 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "secondary": {key: secondary[key] for key in ("ok", "flow_t_h", "pump_idle", "violations")},
         "heat": heat,
         "settled": settled,
+        "late_heat": late,
+        "heat_second": heat_second,
+        "resettled": resettled,
         "split": split,
         "queued": queued,
         "replayed": {key: replayed[key] for key in ("ok", "replayed", "applied")},

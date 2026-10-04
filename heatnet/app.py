@@ -28,7 +28,8 @@ from .primary.network import PrimaryNetwork
 from .pump.curve import PumpCurve
 from .pump.pump import Pump
 from .quota.accumulator import QuotaAccumulator
-from .quota.billing import billing_lines
+from .quota.billing import BASE_RATE, billing_lines
+from .quota.carryover import CarryoverBook
 from .quota.meter import HeatMeter
 from .quota.quota import QuotaLedger
 from .secondary.cycle import run_cycle
@@ -108,6 +109,7 @@ class Platform:
 
         self.meters = QuotaAccumulator()
         self.ledger = QuotaLedger(self.config.quota, self.meters)
+        self.carryover = CarryoverBook(self.ledger, self.clock)
         self._build_meters()
         self.pressure = PressurisingController(
             PressureBaseline(self.config.pressure), self.config.pressure
@@ -555,27 +557,97 @@ class Platform:
             commands = [queue.enqueue(target, source) for target in targets]
             return {"station": station, "queued": [command.as_dict() for command in commands]}
 
-    def collect_heat(self, meter: str, delta_mwh: float) -> dict:
-        """采集一次热量并记进本期总账。"""
+    def collect_heat(self, meter: str, delta_mwh: float, measured_at: float | None = None) -> dict:
+        """采集一次热量：按表型定死的归属规则入账，跨期增量挂预提。"""
 
         with self._lock:
+            arrived_at = self.clock.now()
+            measured = arrived_at if measured_at is None else float(measured_at)
+            if measured > arrived_at:
+                raise ValueError("计量时刻不能晚于到达时刻")
+            kind = self.meters.get(meter).kind
             reading = self.meters.collect(meter, delta_mwh)
-            self.ledger.allocate(meter[: -len(_METER_SUFFIX)], delta_mwh)
-            self.trend.append("heat_mwh", self.clock.now(), self.meters.total_mwh())
+            station = meter[: -len(_METER_SUFFIX)] if meter.endswith(_METER_SUFFIX) else meter
+            decision = self.carryover.book_arrival(
+                meter=meter,
+                station=station,
+                kind=kind,
+                delta_mwh=float(delta_mwh),
+                measured_at=measured,
+                arrived_at=arrived_at,
+            )
+            self.trend.append("heat_mwh", arrived_at, self.meters.total_mwh())
             return {
                 "meter": meter,
                 "delta_mwh": round(float(delta_mwh), 4),
                 "reading_mwh": round(reading, 4),
                 "total_mwh": round(self.meters.total_mwh(), 4),
+                **decision,
             }
 
     def settle_quota(self) -> dict:
-        """结束本期配额并把结算行一并返回。"""
+        """结束本期配额：冲平预提、挂账断流、出结转单，然后分站清零开新期。"""
 
         with self._lock:
+            boundary = self.clock.now()
+            period_no = self.ledger.periods() + 1
             lines = self.billing(self.config.quota.meter_wrap_mwh / 40.0)
-            period = self.ledger.settle()
-            return {**period, "lines": lines}
+            slip = self.carryover.close_period(period_no, boundary)
+            settled = self.ledger.settle()
+            corrections = [
+                {
+                    "station": item["station"],
+                    "mwh": item["amount_mwh"],
+                    "quota_mwh": 0.0,
+                    "overage_mwh": 0.0,
+                    "charge": round(item["amount_mwh"] * BASE_RATE, 2),
+                    "correction": True,
+                    "home_period": item["home_period"],
+                }
+                for item in slip.reversals
+            ]
+            payload = slip.as_dict()
+            self.bus.publish(
+                Event.of(
+                    "quota",
+                    "quota",
+                    "carryover_settled",
+                    severity="warning" if slip.partial else "notice",
+                    message=f"第 {period_no} 期结转单"
+                    + ("（部分失败：采集断流挂账）" if slip.partial else ""),
+                    period=period_no,
+                    partial=slip.partial,
+                    slip=payload,
+                )
+            )
+            for item in payload["new_suspense"]:
+                self.bus.publish(
+                    Event.of(
+                        "quota",
+                        "quota",
+                        "carryover_suspense",
+                        severity="warning",
+                        message="采集断流，缺数挂账",
+                        **item,
+                    )
+                )
+            for item in payload["recoveries"]:
+                self.bus.publish(
+                    Event.of(
+                        "quota",
+                        "quota",
+                        "carryover_recovered",
+                        severity="notice",
+                        message="断流补采到账，挂账冲平",
+                        **item,
+                    )
+                )
+            return {
+                **settled,
+                "lines": lines + corrections,
+                "partial": slip.partial,
+                "carryover": payload,
+            }
 
     def trip(self, reason: str = "overtemperature") -> dict:
         """让热源停机。"""
@@ -751,11 +823,29 @@ class Platform:
     def quota_report(self) -> dict:
         """返回热量表与配额总账报告。"""
 
+        carryover = self.carryover.describe()
         return {
             "ledger": self.ledger.snapshot().as_dict(),
             "accumulator": self.meters.describe(),
             "periods": self.ledger.periods(),
+            "carryover": {
+                "current_period": carryover["current_period"],
+                "slips": len(carryover["slips"]),
+                "outstanding": len(carryover["outstanding"]),
+                "attribution": carryover["attribution"],
+            },
         }
+
+    def carryover_report(self, period: int | None = None) -> dict:
+        """返回结转台账（指定期号时只返回那一张结转单）。"""
+
+        report = self.carryover.describe()
+        if period is None:
+            return report
+        for slip in report["slips"]:
+            if slip["period"] == period:
+                return {"slip": slip}
+        raise KeyError(f"结转单不存在: 第 {period} 期")
 
     def billing(self, quota_mwh: float) -> list[dict]:
         """按站生成配额结算行。"""
